@@ -1,4 +1,5 @@
-
+import pyttsx3
+from pydub import AudioSegment
 import os
 import sys
 import asyncio
@@ -40,7 +41,7 @@ VOSK_MODEL_PATH = os.getenv(
 EMB_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 SUM_MODEL_NAME = "google/flan-t5-small"
 REC_MODEL_NAME = "google/flan-t5-small"
-TTS_MODEL_NAME = "tts_models/ru/ru-Rus/VITS"
+# TTS_MODEL_NAME = "tts_models/ru/mai/tts"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -98,8 +99,8 @@ logger.info(f"Загрузка модели генерации рекоменд�
 rec_tokenizer = AutoTokenizer.from_pretrained(REC_MODEL_NAME)
 rec_model     = AutoModelForSeq2SeqLM.from_pretrained(REC_MODEL_NAME).to(DEVICE)
 
-logger.info(f"Загрузка TTS-модели: {TTS_MODEL_NAME}")
-tts           = TTS(model_name=TTS_MODEL_NAME, progress_bar=False, gpu=(DEVICE=="cuda"))
+# logger.info(f"Загрузка TTS-модели: {TTS_MODEL_NAME}")
+# tts           = TTS(model_name=TTS_MODEL_NAME, progress_bar=False, gpu=(DEVICE=="cuda"))
 
 if not os.path.exists(VOSK_MODEL_PATH):
     logger.error(f"Модель Vosk не найдена по пути {VOSK_MODEL_PATH}. STT не будет доступен.")
@@ -220,14 +221,28 @@ def generate_recommendation(profile_summary: str, context: str) -> str:
 
 def synthesize_speech(text: str) -> bytes:
     """
-    Синтезируем WAV через Coqui TTS (rus VITS) и возвращаем байты.
+    Синтез речи через pyttsx3 + pydub (WAV в память).
     """
-    tmp_path = os.path.join(os.getcwd(), "temp_tts.wav")
-    tts.tts_to_file(text=text, file_path=tmp_path)
-    with open(tmp_path, "rb") as f:
-        data = f.read()
+    import io
+    import tempfile
+
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 150)  # скорость речи
+    engine.setProperty('voice', 'russian')  # если установлен RHVoice или SAPI-голос на Win
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tf:
+        tmp_path = tf.name
+
+    # Сохраняем озвучку во временный WAV-файл
+    engine.save_to_file(text, tmp_path)
+    engine.runAndWait()
+
+    # Загружаем как аудиофайл и конвертируем в байты
+    audio = AudioSegment.from_file(tmp_path, format="wav")
+    buffer = io.BytesIO()
+    audio.export(buffer, format="wav")
     os.remove(tmp_path)
-    return data
+    return buffer.getvalue()
 
 def wav_to_base64(wav_bytes: bytes) -> str:
     return base64.b64encode(wav_bytes).decode("utf-8")
