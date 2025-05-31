@@ -5,7 +5,9 @@ const app = express();
 app.use(express.json());
 
 // Routes
-const inputRoutes = require("./routes/inputRoute");
-app.use("/input", inputRoutes);
+const sensorsRoutes = require("./routes/sensorsRoutes");
+app.use("/sensors", sensorsRoutes);
+const audioRoutes = require("./routes/audioRoutes");
+app.use("/audio", audioRoutes);
 
 module.exports = app;
