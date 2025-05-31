@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+chromadb
+sentence-transformers
+transformers
+torch
+torchvision
+torchaudio
+TTS
+loguru
