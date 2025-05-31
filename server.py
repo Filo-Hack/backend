@@ -3,6 +3,10 @@ from pydub import AudioSegment
 import os
 import sys
 import asyncio
+import torch
+
+import whisper
+
 import base64
 import tempfile
 from typing import List, Optional, Dict
@@ -33,11 +37,7 @@ CHROMADB_PERSIST = os.getenv(
     os.path.join(os.getcwd(), "chroma_data")
 )
 
-VOSK_MODEL_PATH = os.getenv(
-    "VOSK_MODEL_PATH",
-    os.path.join(os.getcwd(), "models", "vosk-ru")
-)
-
+VOSK_MODEL_PATH = "C:\проект\\backend\\models\\vosk"
 EMB_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 SUM_MODEL_NAME = "google/flan-t5-small"
 REC_MODEL_NAME = "google/flan-t5-small"
@@ -54,7 +54,7 @@ logger.add(sys.stderr, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
 
 logger.info(f"Используем persist directory для ChromaDB: {CHROMADB_PERSIST}")
 logger.info(f"Устройство для PyTorch: {DEVICE}")
-logger.info(f"Путь к Vosk-модели: {VOSK_MODEL_PATH}")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. ИНИЦИАЛИЗАЦИЯ ChromaDB (новый API ≥ 0.4.0)
@@ -102,13 +102,9 @@ rec_model     = AutoModelForSeq2SeqLM.from_pretrained(REC_MODEL_NAME).to(DEVICE)
 # logger.info(f"Загрузка TTS-модели: {TTS_MODEL_NAME}")
 # tts           = TTS(model_name=TTS_MODEL_NAME, progress_bar=False, gpu=(DEVICE=="cuda"))
 
-if not os.path.exists(VOSK_MODEL_PATH):
-    logger.error(f"Модель Vosk не найдена по пути {VOSK_MODEL_PATH}. STT не будет доступен.")
-    vosk_model = None
-else:
-    logger.info("Загрузка Vosk-модели …")
-    vosk_model = VoskModel(VOSK_MODEL_PATH)
-    logger.info("Vosk-модель успешно загружена.")
+logger.info("Загрузка Whisper-модели: tiny")
+whisper_model = whisper.load_model("tiny", device=DEVICE)
+logger.info("Whisper-модель загружена.")
 
 logger.info("Все модели успешно загружены.")
 
@@ -248,35 +244,20 @@ def wav_to_base64(wav_bytes: bytes) -> str:
     return base64.b64encode(wav_bytes).decode("utf-8")
 
 def recognize_speech_from_wav(wav_path: str) -> str:
-    if vosk_model is None:
-        raise RuntimeError("Vosk-модель не загружена, STT недоступен.")
-    wf = wave.open(wav_path, "rb")
-    if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() not in (8000, 16000, 48000):
+    import torchaudio
+
+    waveform, sample_rate = torchaudio.load(wav_path)
+
+    # Silero поддерживает только 16kHz аудио, желательно проверить
+    if sample_rate != 16000:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Поддерживаются только WAV PCM 16-бит mono, частота 8k/16k/48k. "
-                f"Ваши параметры: channels={wf.getnchannels()}, "
-                f"samplewidth={wf.getsampwidth()}, framerate={wf.getframerate()}"
-            )
+            detail=f"Silero STT поддерживает только WAV с частотой 16000 Гц. Ваше: {sample_rate} Гц"
         )
-    rec = KaldiRecognizer(vosk_model, wf.getframerate())
-    rec.SetWords(False)
 
-    result_text = ""
-    while True:
-        data = wf.readframes(4000)
-        if len(data) == 0:
-            break
-        if rec.AcceptWaveform(data):
-            res = rec.Result()
-            text_json = json.loads(res)
-            result_text += text_json.get("text", "") + " "
-    final = rec.FinalResult()
-    text_json = json.loads(final)
-    result_text += text_json.get("text", "")
-    wf.close()
-    return result_text.strip()
+    result = silero_model.transcribe([waveform])
+    return result[0]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 8. HTTP-РОУТЫ
@@ -288,7 +269,7 @@ async def health_check():
         "status": "alive",
         "chroma_data_dir": CHROMADB_PERSIST,
         "device": DEVICE,
-        "vosk_model_loaded": bool(vosk_model),
+        "vosk_model_loaded": bool(),
     }
 
 @app.post("/add", summary="Добавить/обновить документ в ChromaDB")
@@ -364,8 +345,7 @@ async def tts_endpoint(req: TTSRequest):
 
 @app.post("/stt", response_model=STTResponse, summary="Распознавание речи из WAV (STT)")
 async def stt_endpoint(file: UploadFile = File(...)):
-    if vosk_model is None:
-        raise HTTPException(status_code=503, detail="STT недоступен: модель Vosk не загружена.")
+
     try:
         suffix = os.path.splitext(file.filename)[1] or ".wav"
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
