@@ -1,6 +1,9 @@
 from loguru import logger
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import Chroma
+# Стало:
+from langchain_community.vectorstores import Chroma
+
+
 from langchain.schema.document import Document
 from typing import List, Dict, Any
 import os
