@@ -1,14 +1,19 @@
+from dbManager import ChromaDBManager
+import os
+from config import settings
+
+import json
+from typing import List,Dict,Any
+from loguru import logger
 class ChatEngine:
     def __init__(self, chroma_db: ChromaDBManager):
         self.chroma_db = chroma_db
-        self.llm = ...  # сюда ваш LLM
 
     def generate_response(self, query: str) -> str:
         context = self.get_relevant_context(query)
         formatted = self.format_context(context)
         prompt = f"Контекст:\n{formatted}\n\nВопрос: {query}\nОтвет:"
-        return self.llm.generate(prompt)
-
+        return prompt
     def save_record(self, data_json):
         """
         Принимает JSON-ответ от сервера и сохраняет каждый документ в отдельный .json файл.
