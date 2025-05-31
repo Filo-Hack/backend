@@ -1,30 +1,44 @@
 # server.py
 
 import os
+import sys
 import asyncio
 import base64
+import tempfile
 from typing import List, Optional, Dict
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from loguru import logger
 
 import chromadb
 from chromadb.config import Settings
 
+import torch
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 from TTS.api import TTS
 
+from vosk import Model as VoskModel, KaldiRecognizer
+import wave
+import json
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. НАСТРОЙКИ И ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Путь к папке, куда ChromaDB будет сохранять свои данные
+# Директория для хранения ChromaDB
 CHROMADB_PERSIST = os.getenv(
     "CHROMADB_PERSIST_DIR",
     os.path.join(os.getcwd(), "chroma_data")
+)
+
+# Путь к модели Vosk
+VOSK_MODEL_PATH = os.getenv(
+    "VOSK_MODEL_PATH",
+    os.path.join(os.getcwd(), "models", "vosk-ru")
 )
 
 # Имена моделей
@@ -34,19 +48,24 @@ REC_MODEL_NAME = "google/flan-t5-small"
 TTS_MODEL_NAME = "tts_models/ru/ru-Rus/VITS"
 
 # Устройство для PyTorch ("cuda" если есть GPU, иначе "cpu")
-DEVICE = "cuda" if torch_available := (os.getenv("CUDA_AVAILABLE", "1") == "1") else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. ИНИЦИАЛИЗАЦИЯ ChromaDB
+# 2. ИНИЦИАЛИЗАЦИЯ ЛОГИРОВАНИЯ И ПАПОК
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Убедимся, что директория существует
+# Создаём директорию для ChromaDB
 os.makedirs(CHROMADB_PERSIST, exist_ok=True)
-logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
+logger.add(sys.stderr, format="{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}", level="INFO")
 
 logger.info(f"Используем persist directory для ChromaDB: {CHROMADB_PERSIST}")
+logger.info(f"Устройство для PyTorch: {DEVICE}")
+logger.info(f"Путь к Vosk-модели: {VOSK_MODEL_PATH}")
 
-# Создаём клиент ChromaDB
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. ИНИЦИАЛИЗАЦИЯ ChromaDB
+# ─────────────────────────────────────────────────────────────────────────────
+
 client = chromadb.Client(
     Settings(
         chroma_db_impl="duckdb+parquet",
@@ -54,7 +73,6 @@ client = chromadb.Client(
     )
 )
 
-# Получаем или создаём коллекцию "user_profiles"
 try:
     collection = client.get_collection(name="user_profiles")
     logger.info("ChromaDB: коллекция 'user_profiles' найдена.")
@@ -63,34 +81,47 @@ except ValueError:
     logger.info("ChromaDB: коллекция 'user_profiles' создана.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. ЗАГРУЗКА МОДЕЛЕЙ (эмбеддинги, суммаризация, генерация, TTS)
+# 4. ЗАГРУЗКА МОДЕЛЕЙ (эмбеддинги, суммаризация, генерация, TTS, Vosk)
 # ─────────────────────────────────────────────────────────────────────────────
 
-logger.info(f"Загрузка модели эмбеддингов: {EMB_MODEL_NAME} (device={DEVICE})")
+# 4.1. SentenceTransformer для эмбеддингов
+logger.info(f"Загрузка EMB-модели: {EMB_MODEL_NAME} (device={DEVICE})")
 emb_model = SentenceTransformer(EMB_MODEL_NAME, device=DEVICE)
 
+# 4.2. Flan-T5 для суммаризации
 logger.info(f"Загрузка модели суммаризации: {SUM_MODEL_NAME}")
 sum_tokenizer = AutoTokenizer.from_pretrained(SUM_MODEL_NAME)
 sum_model = AutoModelForSeq2SeqLM.from_pretrained(SUM_MODEL_NAME).to(DEVICE)
 
-logger.info(f"Загрузка модели генерации рекомендаций: {REC_MODEL_NAME}")
+# 4.3. Flan-T5 для рекомендаций / чата
+logger.info(f"Загрузка модели рекомендаций/чата: {REC_MODEL_NAME}")
 rec_tokenizer = AutoTokenizer.from_pretrained(REC_MODEL_NAME)
 rec_model = AutoModelForSeq2SeqLM.from_pretrained(REC_MODEL_NAME).to(DEVICE)
 
+# 4.4. Coqui TTS
 logger.info(f"Загрузка TTS-модели: {TTS_MODEL_NAME}")
 tts = TTS(model_name=TTS_MODEL_NAME, progress_bar=False, gpu=(DEVICE == "cuda"))
+
+# 4.5. Vosk (STT)
+if not os.path.exists(VOSK_MODEL_PATH):
+    logger.error(f"Модель Vosk не найдена по пути {VOSK_MODEL_PATH}. STT не будет доступен.")
+    vosk_model = None
+else:
+    logger.info("Загрузка Vosk-модели …")
+    vosk_model = VoskModel(VOSK_MODEL_PATH)
+    logger.info("Vosk-модель успешно загружена.")
 
 logger.info("Все модели успешно загружены.")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Pydantic-модели запросов/ответов
+# 5. Pydantic-модели запросов/ответов
 # ─────────────────────────────────────────────────────────────────────────────
 
 class AddDocRequest(BaseModel):
     doc_id: str                         # уникальный идентификатор, напр. "ivan_2025-05-31_07-00"
     document: str                       # текст события, напр. "Иван в 07:00 варит кофе"
     embedding: Optional[List[float]]    # если None, генерируем сами
-    metadata: Dict                      # любые метаданные, напр. {"user_id":"ivan","type":"raw_routine","timestamp":"2025-05-31T07:00:00"}
+    metadata: Dict                      # любые метаданные
 
 class QueryRequest(BaseModel):
     query_embedding: List[float]
@@ -124,38 +155,38 @@ class TTSRequest(BaseModel):
 class TTSResponse(BaseModel):
     audio_base64: str
 
+class STTResponse(BaseModel):
+    text: str
+
 class ChatRequest(BaseModel):
-    history: List[Dict]        # [{"role":"user"|"assistant", "text":"..."}]
+    history: List[Dict]        # [{"role":"user"/"assistant", "text":"..."}]
     user_input: str
 
 class ChatResponse(BaseModel):
     response: str
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. FastAPI-приложение
+# 6. FastAPI-приложение
 # ─────────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(
     title="SmartHome FastAPI Service",
-    description="Всё в одном: ChromaDB + эмбеддинги + суммаризация + рекомендации + TTS + чат",
+    description="Всё в одном: ChromaDB + эмбеддинги + суммаризация + рекомендации + TTS + STT + чат",
     version="1.0.0"
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. УТИЛИТЫ: вспомогательные функции
+# 7. УТИЛИТЫ: вспомогательные функции
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def generate_embedding(text: str) -> List[float]:
-    """
-    Вычисляем embedding для одного текста через SentenceTransformer.
-    """
     emb = emb_model.encode([text], convert_to_numpy=True)
     return emb[0].tolist()
 
 def summarize_texts(texts: List[str]) -> str:
     """
-    Склеиваем список текстов, передаём в flan-t5-small с префиксом "summarize:" и возвращаем summary.
-    Если texts слишком длинный, можно разбить на чанки (по 3-5 штук) и суммаризовать по частям.
+    1) Склеиваем список текстов, формируем промпт
+    2) Передаём в flan-t5-small, получаем summary
     """
     joined = " [SEP] ".join(texts)
     prompt = "summarize: " + joined
@@ -175,13 +206,13 @@ def summarize_texts(texts: List[str]) -> str:
 
 def generate_recommendation(profile_summary: str, context: str) -> str:
     """
-    Генерируем текст рекомендации на flan-t5-small.
+    Генерация рекомендаций на flan-t5-small.
     """
     prompt = (
         f"Профиль пользователя: {profile_summary}\n"
         f"Контекст: {context}\n"
-        "Задача: сформулируй короткую дружелюбную рекомендацию или вопрос "
-        "о том, запускать ли привычную рутину. Ответ дай на русском.\n"
+        "Задача: сформулируй короткую дружелюбную рекомендацию "
+        "или вопрос о том, запускать ли привычную рутину. Ответ дай на русском.\n"
         "Ответ:"
     )
     inputs = rec_tokenizer(
@@ -200,9 +231,11 @@ def generate_recommendation(profile_summary: str, context: str) -> str:
 
 def synthesize_speech(text: str) -> bytes:
     """
-    Генерируем WAV-байты из текста через Coqui TTS. Сохраняем во временный файл, читаем и возвращаем.
+    Генерируем WAV-байты через Coqui TTS и возвращаем.
     """
-    tmp_path = os.path.join(os.getcwd(), "temp_tts.wav")
+    # Используем временный файл, чтобы избежать гонки имён:
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp_path = tmp.name
     tts.tts_to_file(text=text, file_path=tmp_path)
     with open(tmp_path, "rb") as f:
         data = f.read()
@@ -211,12 +244,49 @@ def synthesize_speech(text: str) -> bytes:
 
 def wav_to_base64(wav_bytes: bytes) -> str:
     """
-    Кодирует WAV-байты в base64-строку.
+    Кодируем WAV-байты в base64.
     """
     return base64.b64encode(wav_bytes).decode("utf-8")
 
+def recognize_speech_from_wav(wav_path: str) -> str:
+    """
+    Распознаём речь из WAV-файла с помощью Vosk.
+    Предполагаем: WAV 16kHz, mono, PCM 16-bit.
+    """
+    if vosk_model is None:
+        raise RuntimeError("Vosk-модель не загружена, STT недоступен.")
+    wf = wave.open(wav_path, "rb")
+    if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() not in (8000, 16000, 48000):
+        # Если формат не тот, можно предварительно перекодировать через ffmpeg или уведомить пользователя.
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Поддерживаются только WAV PCM 16-бит mono, частота 8k/16k/48k. "
+                f"Ваши параметры: channels={wf.getnchannels()}, "
+                f"samplewidth={wf.getsampwidth()}, framerate={wf.getframerate()}"
+            )
+        )
+    rec = KaldiRecognizer(vosk_model, wf.getframerate())
+    rec.SetWords(False)
+
+    result_text = ""
+    while True:
+        data = wf.readframes(4000)
+        if len(data) == 0:
+            break
+        if rec.AcceptWaveform(data):
+            res = rec.Result()
+            text_json = json.loads(res)
+            result_text += text_json.get("text", "") + " "
+    # финальный кусок
+    final = rec.FinalResult()
+    text_json = json.loads(final)
+    result_text += text_json.get("text", "")
+    wf.close()
+    return result_text.strip()
+
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. HTTP-РОУТЫ
+# 8. HTTP-РОУТЫ
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.get("/health", summary="Проверка состояния сервера")
@@ -224,15 +294,12 @@ async def health_check():
     return {
         "status": "alive",
         "chroma_data_dir": CHROMADB_PERSIST,
-        "device": DEVICE
+        "device": DEVICE,
+        "vosk_model_loaded": bool(vosk_model),
     }
 
 @app.post("/add", summary="Добавить или обновить документ в ChromaDB")
 async def add_document(req: AddDocRequest):
-    """
-    Записываем документ в ChromaDB.
-    Если req.embedding == None, генерируем embedding автоматически.
-    """
     try:
         if req.embedding is None:
             emb = await generate_embedding(req.document)
@@ -253,9 +320,6 @@ async def add_document(req: AddDocRequest):
 
 @app.post("/query", response_model=QueryResponse, summary="Поиск ближайших документов в ChromaDB")
 async def query_documents(req: QueryRequest):
-    """
-    Ищем ближайшие n_results документов по переданному embedding.
-    """
     try:
         resp = collection.query(
             query_embeddings=[req.query_embedding],
@@ -322,13 +386,47 @@ async def tts_endpoint(req: TTSRequest):
 
     return TTSResponse(audio_base64=b64)
 
+@app.post("/stt", response_model=STTResponse, summary="Распознавание речи из WAV-аудио (STT)")
+async def stt_endpoint(file: UploadFile = File(...)):
+    """
+    Принимает multipart/form-data с одним полем 'file' (WAV-аудио PCM 16-бит,mono).
+    Возвращает JSON { "text": "распознанный текст" }.
+    """
+    if vosk_model is None:
+        raise HTTPException(status_code=503, detail="STT недоступен: модель Vosk не загружена.")
+
+    # Сохраняем WAV во временный файл
+    try:
+        suffix = os.path.splitext(file.filename)[1] or ".wav"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+            contents = await file.read()
+            tmp.write(contents)
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении полученного файла: {e}")
+        raise HTTPException(status_code=500, detail="Не удалось сохранить загруженный файл.")
+
+    # Распознаём
+    try:
+        text = recognize_speech_from_wav(tmp_path)
+    except HTTPException as he:
+        os.remove(tmp_path)
+        raise he
+    except Exception as e:
+        os.remove(tmp_path)
+        logger.error(f"Ошибка в STT-модуле: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка при распознавании речи: {e}")
+
+    # Удаляем временный файл
+    os.remove(tmp_path)
+    return STTResponse(text=text)
+
 @app.post("/chat", response_model=ChatResponse, summary="Простой чат-режим")
 async def chat(req: ChatRequest):
     """
-    Если нужно реализовать общий чат: берём history + user_input, строим prompt, отвечаем через flan-t5-small.
+    Берём history + user_input, строим prompt, отвечаем через flan-t5-small.
     """
     try:
-        # Собираем историю чата
         parts = []
         for msg in req.history:
             role = msg.get("role", "user")
@@ -359,16 +457,16 @@ async def chat(req: ChatRequest):
     return ChatResponse(response=response)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. ЗАПУСК UVICORN (если запустить как python server.py)
+# 9. ЗАПУСК UVICORN (если запускаем напрямую)
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import uvicorn, sys
+    import uvicorn
     logger.info("Запускаем Uvicorn server:app …")
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
         port=8000,
         log_level="info",
-        reload=False  # В продакшне False, при разработке можно True
+        reload=False  # в продакшне False, в dev можно True
     )

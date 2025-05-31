@@ -1,10 +1,35 @@
+# Требуемая версия Python: 3.10.x
+
 fastapi
-uvicorn[standard]
+uvicorn
+
+# ChromaDB (DuckDB+Parquet backend)
 chromadb
+
+# Модели эмбеддингов
 sentence-transformers
-transformers
+# для SentenceTransformers требуется torch
 torch
-torchvision
-torchaudio
-TTS
+
+# Transformers (Flan-T5)
+transformers
+
+# Покладочный TTS (Coqui TTS)
+TTS==0.20.6
+
+
+
+# Для распознавания речи
+vosk
+# Возможно потребуется wheel для vosk, но pip сам подберёт нужный пакет
+
+# Помощники
+pydantic
 loguru
+
+# Запросы (если понадобятся внешние api, не обязательна)
+# requests==2.31.0
+
+# Если в будущем захочется хранить окружение в конкретном lock-файле:
+# pip-tools (опционально для самостоятельного лечения зависимостей)
+# pip-tools==7.3.0
