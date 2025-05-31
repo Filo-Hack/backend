@@ -9,7 +9,6 @@ const uploadVoice = async (req, res) => {
     const outputFilename = await audioService.convertToMp3(req.file.path);
     return res.status(200).json({
       message: "Файл получен и сконвертирован",
-      filename: outputFilename,
     });
   } catch (error) {
     console.error("Ошибка:", error);
