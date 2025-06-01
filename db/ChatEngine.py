@@ -9,8 +9,8 @@ class ChatEngine:
     def __init__(self, chroma_db: ChromaDBManager):
         self.chroma_db = chroma_db
 
-    def generate_response(self, query: str,data_json) -> str:
-        context = self.get_relevant_context(query,data_json["metadata"]["voice_embedding"])
+    def generate_response(self, query: str) -> str:
+        context = self.get_relevant_context(query)
         formatted = self.format_context(context)
         prompt = f"Контекст:\n{formatted}\n\nВопрос: {query}\nОтвет:"
         return prompt
@@ -47,8 +47,6 @@ class ChatEngine:
 
     from typing import Optional
 
-
-
     def get_relevant_context(
             self,
             query: Optional[str] = None,
@@ -70,8 +68,6 @@ class ChatEngine:
         except Exception as e:
             logger.error(f"Ошибка при поиске контекста: {e}")
             return []
-
-
 
     def format_context(self, context: List[Dict[str, Any]]) -> str:
         formatted = []

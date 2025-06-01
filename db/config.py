@@ -14,8 +14,7 @@ class Config(BaseSettings):
     CHUNK_OVERLAP: int = 50
     LM_MODEL_NAME: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     YANDX_MODEL_NAME: str = "yandex-chat"
-    # OPENAI_MODEL_NAME: str = "gpt-3.5-turbo"
-    # OPENAI_API_KEY: SecretStr
+
     LM_MODEL_NAME: str = "sentence-transformers/paraphrase-MiniLM-L6-v2"
     model_config = SettingsConfigDict(env_file=f"{BASE_DIR}/.env")
 settings = Config()
